@@ -1,0 +1,14 @@
+data
+__pycache__
+*.DS_Store
+checkpoints
+checkpoints/**
+dataset
+dataset/**
+*.pth
+*.csv
+*.pdf
+*.txt
+*.sh
+*.png
+*.json
