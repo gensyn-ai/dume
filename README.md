@@ -1,6 +1,6 @@
 # Training-Free Dynamic Upcycling of Expert Language Models
 
-This repository contains the code and instructions to replicate the experiments in the paper [Training-free Dynamic Upcycling Ofexpert Language Models](https://openreview.net/pdf?id=D6EhxUagX7).
+This repository contains the code and instructions to replicate the experiments in the paper [Training-free Dynamic Upcycling of Expert Language Models](https://openreview.net/pdf?id=D6EhxUagX7).
 
 ![DUME](./assets/method.png)
 
