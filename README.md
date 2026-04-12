@@ -38,7 +38,7 @@ See our datasets setup guide [here](dataset/README.md).
 ```
 @misc{fani2026training,
   title={Training-Free Dynamic Upcycling of Expert Language Models},
-  author={Fan{\`i}, Eeos and Ersoy, O{\u{g}}uzhan},
+  author={Fan{\`i}, Eros and Ersoy, O{\u{g}}uzhan},
   booktitle={1st Workshop on Scaling Post-training for LLMs (SPOT) @ ICLR 2026},
   year={2026},
 }
