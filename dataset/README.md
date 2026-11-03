@@ -1,5 +1,9 @@
 # Datasets setup
 
+## Reasoning datasets
+
+There is no need to download and configure the datasets manually, as this is handled automatically by the code.
+
 ## Causal language modeling datasets
 
 ### OpenWebText Corpus dataset for pre-training
@@ -39,7 +43,7 @@
     mv [path/to/]hdee/dataset/openwebtext dataset/  # or create a soft link with ln -s
     ```
 
-### Domain experts datasets
+### CLM SMALL domain experts datasets
 
 1. Follow the steps for the OpenWebText Corpus dataset.
 2. Modify the ```hdee/scripts/load_single_M2D2_domain_dataset.sh``` script with your HuggingFace access token and ```meta-llama/Meta-Llama-3-8B``` as the tokenizer name.
@@ -53,6 +57,9 @@
     mv [path/to/]hdee/dataset/[dataset] dataset/  # or create a soft link with ln -s
     ```
 
-## Reasoning datasets
+### CLM MEDIUM domain experts datasets
 
-There is no need to download and configure the datasets manually, as this is handled automatically by the code.
+The four CLM MEDIUM domains are loaded from HuggingFace: ```math``` ([open-web-math](https://huggingface.co/datasets/open-web-math/open-web-math)), ```bio``` ([peS2o](https://huggingface.co/datasets/allenai/peS2o)), ```legal``` ([pile-of-law](https://huggingface.co/datasets/pile-of-law/pile-of-law)) and ```dialogue``` ([ultrachat_200k](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k)). To download them in advance, run from the root directory of this repository:
+```
+python download_clm2_datasets.py
+```

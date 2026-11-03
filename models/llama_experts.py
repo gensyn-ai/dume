@@ -1,6 +1,6 @@
 from models.llama import LlamaWrapper, LlamaWrapperWithMLPSize
 
-def get_llama_expert(num_parameters, config=None, moe_experts=None, k=1, temp=0.1, _lambda=0.01, context_dim=512, alpha=None):
+def get_llama_expert(num_parameters, config=None, moe_experts=None, attn_implementation="eager", k=1, temp=0.1, _lambda=0.01, context_dim=512, alpha=None):
     
     if num_parameters == 5e6:
         batch_size = 2.62e5
@@ -124,6 +124,24 @@ def get_llama_expert(num_parameters, config=None, moe_experts=None, k=1, temp=0.
             alpha=alpha
         ), batch_size, max_lr
 
+    if num_parameters == 1e9:
+        batch_size = 1.72e6
+        max_lr = 4e-4
+        return LlamaWrapperWithMLPSize(
+            config=config,
+            hidden_size=-1,
+            intermediate_size=-1,
+            num_attention_heads=-1,
+            num_hidden_layers=-1,
+            attn_implementation=attn_implementation,
+            moe_experts=moe_experts,
+            k=k,
+            temp=temp,
+            _lambda=_lambda,
+            context_dim=context_dim,
+            alpha=alpha,
+        ), batch_size, max_lr
+
     if num_parameters == 3e9:
         batch_size = 1.72e6
         max_lr = 3e-4
@@ -133,12 +151,13 @@ def get_llama_expert(num_parameters, config=None, moe_experts=None, k=1, temp=0.
             intermediate_size=-1,
             num_attention_heads=-1,
             num_hidden_layers=-1,
+            attn_implementation=attn_implementation,
             moe_experts=moe_experts,
             k=k,
             temp=temp,
             _lambda=_lambda,
             context_dim=context_dim,
-            alpha=alpha
+            alpha=alpha,
         ), batch_size, max_lr
     
     raise ValueError(f"Unsupported number of parameters: {num_parameters}")

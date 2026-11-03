@@ -3,11 +3,10 @@ import argparse
 
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.api import MixedPrecision, ShardingStrategy
-from transformers import set_seed
+from transformers import set_seed, LlamaForCausalLM
 
-from clm_trainer import train, eval
+from clm_trainer import save_checkpoint, train, eval
 from utils.distributed import cleanup_distributed, distributed_init
 from utils.datasets_utils import get_dataloaders
 from utils.optimizer import get_training_strategy
@@ -28,8 +27,36 @@ def get_args():
     parser.add_argument("--num-val-steps", type=int, default=2000, help="Number of validation steps")
     parser.add_argument("--num-test-steps", type=int, default=4000, help="Number of test evaluation steps")
     parser.add_argument("--eval-interval", type=int, default=10000, help="Evaluation interval in steps")
+    parser.add_argument("--freeze_attn", action='store_true', help="Set to true to train only the MLP layers")
+    parser.add_argument("--print-loss-interval", type=int, default=10, help="Loss printing interval in steps")
+    parser.add_argument("--use-flash-attn", action='store_true', help="Whether to use flash attention implementation")
+    parser.add_argument("--store-best-val", action='store_true', help="Whether to store the best validation checkpoint during training")
+    parser.add_argument("--comment", type=str, default="", help="Additional comment to add to the checkpoint filename")
     args = parser.parse_args()
     return args
+
+
+def load_pretrained_model(num_parameters, pretrained_path, is_main):
+    if num_parameters == 1e9:
+        base_model = LlamaForCausalLM.from_pretrained('meta-llama/Llama-3.2-1B')
+        config = base_model.config
+    else:
+        config = None
+    model, _, max_lr = get_llama_expert(num_parameters, config=config)
+    max_lr *= 0.1
+    if os.path.isfile(pretrained_path):
+        if is_main:
+            print(f"Loading checkpoint from {pretrained_path}")
+        state = torch.load(pretrained_path, map_location='cpu')
+        load_res = model.load_state_dict(state, strict=False)
+        if is_main:
+            if getattr(load_res, 'missing_keys', None) or getattr(load_res, 'unexpected_keys', None):
+                print(f"Loaded with missing keys: {getattr(load_res, 'missing_keys', [])}")
+                print(f"Loaded with unexpected keys: {getattr(load_res, 'unexpected_keys', [])}")
+    else:
+        if is_main:
+            print(f"Checkpoint path not found: {pretrained_path}")    
+    return model, max_lr
 
 
 def main():
@@ -38,23 +65,13 @@ def main():
     args = get_args()
 
     set_seed(args.seed)
-    model, _, max_lr = get_llama_expert(args.num_parameters)
-    max_lr *= 0.1
     
-    if os.path.isfile(args.pretrained_path):
-        if is_main:
-            print(f"Loading checkpoint from {args.pretrained_path}")
-        state = torch.load(args.pretrained_path, map_location='cpu')
-        load_res = model.load_state_dict(state, strict=False)
-        if is_main:
-            if getattr(load_res, 'missing_keys', None) or getattr(load_res, 'unexpected_keys', None):
-                print(f"Loaded with missing keys: {getattr(load_res, 'missing_keys', [])}")
-                print(f"Loaded with unexpected keys: {getattr(load_res, 'unexpected_keys', [])}")
-    else:
-        if is_main:
-            print(f"Checkpoint path not found: {args.pretrained_path}")
-
+    model, max_lr = load_pretrained_model(args.num_parameters, args.pretrained_path, is_main)
     model.to(device)
+
+    if args.freeze_attn:
+        for name, param in model.named_parameters():
+            param.requires_grad = False if 'train_linear' not in name and 'mlp' not in name else True
 
     model.train()
 
@@ -72,28 +89,36 @@ def main():
     dataloaders = get_dataloaders(dataset_name=args.domain, batch_size=args.batch_size, num_workers=args.num_workers)
     loss_fn, optimizer, scheduler = get_training_strategy(model, max_lr, args.warmup_steps, args.num_steps)
 
-    train(dataloaders['train'], dataloaders['validation'], model,
-          loss_fn, optimizer, scheduler,
-          device, amp_dtype, use_fsdp,
-          args.num_steps, args.num_val_steps, args.grad_accum_steps, args.eval_interval, is_main)
+    train(
+        train_dataloader=dataloaders['train'],
+        val_dataloader=dataloaders['validation'],
+        model=model,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        amp_dtype=amp_dtype,
+        use_fsdp=use_fsdp,
+        num_steps=args.num_steps,
+        num_val_steps=args.num_val_steps,
+        grad_accum_steps=args.grad_accum_steps,
+        eval_interval=args.eval_interval,
+        is_main=is_main,
+        print_loss_interval=args.print_loss_interval,
+        store_best_val=args.store_best_val,
+        num_parameters=args.num_parameters,
+        domain=args.domain,
+        seed=args.seed,
+        freeze_attn=args.freeze_attn,
+        comment=args.comment
+    )
 
     # Final Test Eval
     eval(dataloaders['test'], model, tot_steps=args.num_test_steps, device=device, ev_type='Test', dtype=amp_dtype)
 
-    # Save checkpoint on rank 0
-    if is_main:
-        if not os.path.exists('checkpoints'):
-            os.makedirs('checkpoints')
-    if use_fsdp:
-        # Gather a full state dict on rank 0 only
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
-            full_state_dict = model.state_dict()
-        if is_main:
-            torch.save(full_state_dict, f'checkpoints/llama_{int(args.num_parameters)}_{args.domain}_seed={args.seed}.pth')
-    else:
-        if is_main:
-            torch.save(model.state_dict(), f'checkpoints/llama_{int(args.num_parameters)}_{args.domain}_seed={args.seed}.pth')
-
+    if not args.store_best_val:
+        save_checkpoint(is_main, use_fsdp, model, args.num_parameters, args.domain, args.seed, args.freeze_attn, args.comment)
+    
     cleanup_distributed()
     
 
