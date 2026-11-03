@@ -16,12 +16,16 @@ def get_args():
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
     parser.add_argument('--num-parameters', type=float, default=1.15e8, help='Number of model parameters')
     parser.add_argument("--num-test-steps", type=int, default=4000, help="Number of test evaluation steps")
+    parser.add_argument("--freeze_attn", action='store_true', default=False, help="Set to true to load a model that trains only the MLP layers")
     args = parser.parse_args()
     return args
 
 
-def load_domain_statedict(domain, seed=42, num_parameters=1.15e8):
-    path = os.path.join('checkpoints', f"llama_{int(num_parameters)}_{domain}{f'_seed={seed}' if seed != 42 else ''}.pth")
+def load_domain_statedict(domain, seed=42, num_parameters=1.15e8, freeze_attn=False):
+    # str_seed = "_seed=42" if args.num_parameters == 1.15e8 or args.freeze_attn else f"_seed={args.seed}"
+    str_seed = f"_seed={seed}"
+    path = f"checkpoints/llama_{int(num_parameters)}_{domain}{str_seed}{'_freeze_attn' if freeze_attn else ''}.pth"
+    print(path)
     if os.path.isfile(path):
         print(f"Loading checkpoint from {path}")
         state = torch.load(path, map_location='cpu')
@@ -47,7 +51,7 @@ def main():
 
         model, _, _ = get_llama_expert(args.num_parameters)
 
-        state_dict = load_domain_statedict(domain_1, seed=args.seed, num_parameters=args.num_parameters)
+        state_dict = load_domain_statedict(domain_1, seed=args.seed, num_parameters=args.num_parameters, freeze_attn=args.freeze_attn)
         model.load_state_dict(state_dict, strict=False)
         model.to(device)
 

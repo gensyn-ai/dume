@@ -28,7 +28,7 @@ def check_correctness(check_program, timeout, task_id, completion_id):
     manager = multiprocessing.Manager()
     result = manager.list()
 
-    timeout = 20
+    timeout = 60
     p = multiprocessing.Process(target=unsafe_execute, args=(check_program, result, timeout))
     p.start()
     p.join(timeout=timeout + 1)

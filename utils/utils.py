@@ -4,6 +4,7 @@ from copy import deepcopy
 import torch
 
 from models.llama_experts import get_llama_expert
+from models.modeling_gemma import Gemma2ForCausalLM
 from lm_eval.tasks import get_task_dict
 
 
@@ -64,13 +65,18 @@ def get_task(task_name):
     return task_dict, limit
 
 
-def load_moerged_model(ckpt_path, num_parameters, k, temp, _lambda, context_dim, num_domains):
+def load_moerged_model(ckpt_path, num_parameters, k, temp, _lambda, context_dim, num_domains, model_type):
 
     print(f"Loading MoErged model from {ckpt_path}...")
     checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
     print("Reconstructing model architecture...")
-    model, _, _ = get_llama_expert(num_parameters, config=checkpoint['config'])
+    if model_type == "llama":
+        model, _, _ = get_llama_expert(num_parameters, config=checkpoint['config'])
+    elif model_type == "gemma":
+        model = Gemma2ForCausalLM(checkpoint['config'])
+    else:
+        raise NotImplementedError(f"Model type {model_type} not supported")
 
     moe_experts = []
     experts_names = []
@@ -91,8 +97,14 @@ def load_moerged_model(ckpt_path, num_parameters, k, temp, _lambda, context_dim,
                     strict=True
                 )
     
-    model_custom, _, _ = get_llama_expert(config=checkpoint['config'], num_parameters=num_parameters, moe_experts=moe_experts,
-                                            k=k, temp=temp, _lambda=_lambda, context_dim=context_dim)
+    if model_type == 'llama':
+        model_custom, _, _ = get_llama_expert(config=checkpoint['config'], num_parameters=num_parameters, moe_experts=moe_experts,
+                                                k=k, temp=temp, _lambda=_lambda, context_dim=context_dim)
+    elif model_type == 'gemma':
+        model_custom = Gemma2ForCausalLM(checkpoint['config'], moe_experts=moe_experts, k=k, temp=temp, _lambda=_lambda, context_dim=context_dim)
+    else:
+        raise NotImplementedError(f"Model type {model_type} not supported")
+    
     model_custom.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
     config = checkpoint['config']

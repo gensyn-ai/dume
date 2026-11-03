@@ -153,7 +153,7 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x, expert_id=None):
+    def forward(self, x, expert_id=None, layer_id=None):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -280,7 +280,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config) if moe_experts is None else MoE(
-            experts=moe_experts[layer_idx], k=k, temperature=temp, _lambda=_lambda, context_dim=context_dim, alpha=alpha
+            experts=moe_experts[layer_idx], layer_id=layer_idx, k=k, temperature=temp, _lambda=_lambda, context_dim=context_dim, alpha=alpha
         )
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -296,6 +296,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         expert_id: Optional[int] = None,
+        layer_id: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -316,7 +317,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, expert_id=expert_id)
+        hidden_states = self.mlp(hidden_states, expert_id=expert_id, layer_id=layer_id)
 
         p, u = None, None
         if isinstance(self.mlp, MoE):
@@ -330,9 +331,9 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         
         return hidden_states
 
-    def set_rr_gate_mode(self, mode: bool):
+    def set_rr_gate_mode(self, mode: bool, reset: bool = False, layer_id: int | None = None):
         if isinstance(self.mlp, MoE):
-            self.mlp.set_rr_gate_mode(mode)
+            self.mlp.set_rr_gate_mode(mode, reset=reset, layer_id=layer_id)
 
 
 @auto_docstring
@@ -407,6 +408,7 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,  # type: ignore
         use_cache: Optional[bool] = None,
         expert_id: Optional[int] = None,
+        layer_id: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         """
@@ -415,6 +417,8 @@ class LlamaModel(LlamaPreTrainedModel):
         Args:
             expert_id (`int`, *optional*):
                 ID of the specific expert to use for MoE routing. Defaults to None.
+            layer_id (`int`, *optional*):
+                ID of the specific layer_id to use to extract DUME statistics. Defaults to None.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -458,6 +462,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 expert_id=expert_id,
+                layer_id=layer_id,
                 **kwargs,
             )
             if isinstance(hidden_states, tuple):
@@ -476,9 +481,25 @@ class LlamaModel(LlamaPreTrainedModel):
             return out, all_p, all_u  # type: ignore
         return out
 
-    def set_rr_gate_mode(self, mode: bool):
+    def set_rr_gate_mode(self, mode: bool, reset: bool = False, layer_id: int | None = None):
         for layer in self.layers:
-            layer.set_rr_gate_mode(mode)  # type: ignore
+            layer.set_rr_gate_mode(mode, reset=reset, layer_id=layer_id)  # type: ignore
+
+    def add_expert(self, state_dict):
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer.mlp, MoE):
+                exp_state_dict = {
+                    "gate_proj.weight": state_dict[f"_model.model.layers.{i}.mlp.gate_proj.weight"],
+                    "up_proj.weight": state_dict[f"_model.model.layers.{i}.mlp.up_proj.weight"],
+                    "down_proj.weight": state_dict[f"_model.model.layers.{i}.mlp.down_proj.weight"],
+                }
+                layer.mlp.add_expert(exp_state_dict) # type: ignore
+    
+    def remove_last_expert(self):
+        for layer in self.layers:
+            if isinstance(layer.mlp, MoE):
+                layer.mlp.remove_last_expert()  # type: ignore
+
 
 @auto_docstring
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
@@ -533,6 +554,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         expert_id: Optional[int] = None,
+        layer_id: Optional[int] = None,
         alpha: Optional[float] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
@@ -542,6 +564,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         Args:
             expert_id (`int`, *optional*):
                 ID of the specific expert to use for MoE routing. Defaults to None.
+            layer_id (`int`, *optional*):
+                ID of the specific layer_id to use to extract DUME statistics. Defaults to None.
             alpha (`float`, *optional*):
                 Load balancing hyperparameter for MoE. Defaults to None.
 
@@ -570,6 +594,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             cache_position=cache_position,
             expert_id=expert_id,
+            layer_id=layer_id,
             alpha=alpha,
             **kwargs,
         )
@@ -600,8 +625,14 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             return out, all_p, all_u  # type: ignore
         return out
 
-    def set_rr_gate_mode(self, mode: bool):
-        self.model.set_rr_gate_mode(mode)
+    def set_rr_gate_mode(self, mode: bool, reset: bool = False, layer_id: int | None = None):
+        self.model.set_rr_gate_mode(mode, reset=reset, layer_id=layer_id)
+
+    def add_expert(self, state_dict):
+        self.model.add_expert(state_dict)
+    
+    def remove_last_expert(self):
+        self.model.remove_last_expert()
 
 
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...

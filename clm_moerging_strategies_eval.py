@@ -6,21 +6,29 @@ import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import MixedPrecision, ShardingStrategy
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, LlamaForCausalLM
 
 from clm_trainer import train, eval
+from clm_train_experts import load_pretrained_model
 from models.llama_experts import get_llama_expert
+from models.modeling_gemma import Gemma2ForCausalLM
 from utils.distributed import distributed_init
 from utils.datasets_utils import BufferedShuffleConcat, get_dataloaders
+from utils.merging_utils import random_drop_and_rescale, ties_merging, fisher_merging, consensus_merging
 from utils.utils import align_and_stack
 from utils.optimizer import get_training_strategy
+from clm2_train_experts import get_dataloaders as get_clm2_dataloaders
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Evaluation of several MoErging techniques')
-    parser.add_argument('--method', type=str, choices=['oracle', 'random_routing', 'DUME', 'BTX', 'DUMEplus'], required=True, help='Experiment type to run')
+    parser.add_argument('--setting', type=str, choices=['clm', 'clm2'], default='clm2', help='Whether to evaluate the Moerging techniques on the CLM or CLM2 experts')
+    parser.add_argument('--method', type=str, choices=['oracle', 'random_routing', 'DUME', 'DUMErec', 'BTX', 'DUMEplus'], required=True, help='Experiment type to run')
+    parser.add_argument('--merging-strategy', type=str, choices=['average', 'task-arithmetic', 'ties-merging', 'DARE', 'Fisher', 'consensus'], default='consensus', help='Merging strategy to use for the non-MLP layers when creating the Moerged model.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed of the loaded experts')
-    parser.add_argument('--num_parameters', type=float, default=1.15e8, help='Number of parameters for the base dense model experts')
+    parser.add_argument('--num_parameters', type=float, default=1e9, help='Number of parameters for the base dense model experts')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
+    parser.add_argument('--grad_accumulation_steps', type=int, default=1, help='Number of gradient accumulation steps for BTX or DUME+ training')
     parser.add_argument('--num_dume_stats_steps', type=int, default=1000, help='Maximum number of steps for DUME statistics extraction')
     parser.add_argument('--num_test_steps', type=int, default=4000, help='Maximum number of steps for evaluation')
     parser.add_argument('--num_workers', type=int, default=2, help='Number of workers for data loading')
@@ -29,19 +37,72 @@ def get_args():
     parser.add_argument('--_lambda', type=float, default=1e-2, help='Lambda for DUME routers')
     parser.add_argument('--num_dume_tokens', type=int, default=10000, help='Number of tokens to use for DUME statistics collection')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for BTX or DUME+ training')
-    parser.add_argument('--num_steps', type=int, default=1000, help='Number of training steps for BTX or DUME+ training')
+    parser.add_argument('--num_steps', type=int, default=100, help='Number of training steps for BTX or DUME+ training')
     parser.add_argument('--alpha', type=float, default=None, help='Alpha value for BTX or DUME+ training. Set to None for other experiments.')
+    parser.add_argument("--freeze_attn", action='store_true', default=False, help="Set to true to load a model that trains only the MLP layers")
+    parser.add_argument("--print_loss_interval", type=int, default=10, help="Interval for printing training loss during BTX or DUME+ training")
+    parser.add_argument("--task-arithmetic-lambda", type=float, default=None, help="Lambda for task arithmetic merging strategy, controlling the weight of each task vector.")
+    parser.add_argument("--ties-merging-k", type=float, default=None, help="Top-k% parameters to keep for TIES merging strategy.")
+    parser.add_argument("--dare-p", type=float, default=None, help="Drop probability for DARE merging strategy.")
+    parser.add_argument('--max-num-tokens', type=int, default=1024, help='Maximum number of tokens per sample for the clm2 setting')
+    parser.add_argument('--max-num-samples', type=int, default=100000, help='Maximum number of samples to use in the dataset for the clm2 setting')
+    parser.add_argument('--num-fisher-steps', type=int, default=1000, help='Number of steps to use for estimating the Fisher information matrices for the Fisher merging strategy.')
+    parser.add_argument('--consensus-threshold', type=int, default=3, help='Threshold for consensus merging strategy, controlling the minimum agreement required across task vectors to keep a parameter change.')
+    parser.add_argument('--consensus-lambda-sparsity', type=float, default=0.3, help='Sparsity parameter for mask computation. Higher values = sparser masks.')
     args = parser.parse_args()
     return args
 
 
 def moerge(state_dicts, device, num_parameters=1.15e8,
            domains=('cs_l1', 'math_l1', 'physics_l1', 'History_and_events', 'Philosophy_and_thinking'),
-           k=1, temp=1.0, _lambda=1e-2, context_dim=1024, config=None, alpha=None, return_moe_experts=False):
+           k=1, temp=1.0, _lambda=1e-2, context_dim=1024, config=None, alpha=None, return_moe_experts=False,
+           merging_strategy='average', ta_lambda=None, ties_merging_k=None, dare_p=None, num_fisher_steps=None,
+           all_dataloaders=None, consensus_threshold=None, consensus_lambda_sparsity=None, model_type='llama'):
+    
+    assert merging_strategy != 'task-arithmetic' or (merging_strategy == 'task-arithmetic' and ta_lambda is not None), "task-arithmetic-lambda must be provided if merging-strategy is task-arithmetic."
+    assert merging_strategy != 'ties-merging' or (merging_strategy == 'ties-merging' and ties_merging_k is not None), "ties-merging-k must be provided if merging-strategy is ties-merging."
+    assert merging_strategy != 'DARE' or (merging_strategy == 'DARE' and dare_p is not None), "dare-p must be provided if merging-strategy is DARE."
+    assert merging_strategy != 'Fisher' or (merging_strategy == 'Fisher' and num_fisher_steps is not None), "num_fisher_steps must be provided if merging-strategy is Fisher."
+    assert merging_strategy != 'consensus' or (merging_strategy == 'consensus' and consensus_threshold is not None and consensus_lambda_sparsity is not None), "consensus-threshold and consensus-lambda-sparsity must be provided if merging-strategy is consensus."
 
     print("MoErging the dense experts...")
     moe_experts = []
-    model, _, _ = get_llama_expert(num_parameters, config=config)
+    if model_type == "llama":
+        model, _, _ = get_llama_expert(num_parameters, config=config)
+    elif model_type == "gemma":
+        model = Gemma2ForCausalLM.from_pretrained("MergeBench/gemma-2-9b_coding", torch_dtype=torch.bfloat16, device_map="cpu")  # any model works
+    else:
+        raise NotImplementedError(f"Model type {model_type} not supported")
+
+    if merging_strategy in ('task-arithmetic', 'ties-merging', 'DARE', 'Fisher', 'consensus'):
+    
+        print("Loading base_model...")
+        pretrained_path = f'checkpoints/llama_{int(num_parameters)}_pretrained.pth'
+        base_model, _ = load_pretrained_model(num_parameters, pretrained_path, True)
+        base_model_state_dict = base_model.state_dict()
+    
+        if merging_strategy in ('ties-merging', 'Fisher', 'consensus'):
+            
+            print("Extracting task vectors...")
+            task_vectors = {}
+            for domain_idx in range(len(domains)):
+                task_vector = {}
+                for _k in state_dicts[domain_idx].keys():
+                    if 'mlp' not in _k:  # Only apply TIES merging to non-MLP layers, keep MLP layers separate for each domain
+                        task_vector[_k] = state_dicts[domain_idx][_k] - base_model_state_dict[_k]  # type: ignore
+                task_vectors[domains[domain_idx]] = task_vector
+            base_model_state_dict = {k: v for k, v in base_model_state_dict.items() if 'mlp' not in k}  #type: ignore # Keep only non-MLP layers in the base model state dict for merging
+            
+            if merging_strategy == 'ties-merging':
+                print(f"Performing TIES merging with {len(task_vectors)} task vectors...")
+                merged_state_dict = ties_merging(task_vectors, base_model_state_dict, ties_merging_k)
+            elif merging_strategy == 'Fisher':
+                print(f"Performing Fisher merging with {len(task_vectors)} task vectors...")
+                merged_state_dict = fisher_merging(task_vectors, base_model_state_dict, base_model, state_dicts, all_dataloaders, device, num_steps=num_fisher_steps)  # type: ignore
+            elif merging_strategy == 'consensus':
+                print(f"Performing Consensus merging with {len(task_vectors)} task vectors...")
+                merged_state_dict = consensus_merging(task_vectors, base_model_state_dict, consensus_threshold=consensus_threshold, lambda_sparsity=consensus_lambda_sparsity)  # type: ignore
+
     experts_names = []
     moerged_state_dict = {}
     for _k in tqdm(state_dicts[0].keys()):
@@ -58,15 +119,36 @@ def moerge(state_dicts, device, num_parameters=1.15e8,
                     strict=True
                 )
         else:
-            # Average the parameters for non-MLP layers
-            tensors = [sd[_k] for sd in state_dicts]
-            if len(set(t.shape for t in tensors)) != 1:
-                print(f"Warning: Aligning tensors for key: {_k}, shapes: {[t.shape for t in tensors]}")
-                moerged_state_dict[_k] = torch.mean(align_and_stack(tensors), dim=0)
+            if merging_strategy == 'average':
+                # Average the parameters for non-MLP layers
+                tensors = [sd[_k] for sd in state_dicts]
+                if len(set(t.shape for t in tensors)) != 1:
+                    print(f"Warning: Aligning tensors for key: {_k}, shapes: {[t.shape for t in tensors]}")
+                    moerged_state_dict[_k] = torch.mean(align_and_stack(tensors), dim=0)
+                else:
+                    moerged_state_dict[_k] = torch.mean(torch.stack(tensors), dim=0)
+            elif merging_strategy in ('task-arithmetic', 'DARE'):
+                # Use task arithmetic for non-MLP layers
+                task_vectors = []
+                for domain_idx in range(len(domains)):
+                    task_vector = state_dicts[domain_idx][_k] - base_model_state_dict[_k]  # type: ignore
+                    if merging_strategy == 'DARE':
+                        task_vector = random_drop_and_rescale(task_vector, p=dare_p)
+                    task_vectors.append(task_vector)
+                task_vectors = torch.stack(task_vectors, dim=0)  # [num_domains, *param_shape]
+                moerged_state_dict[_k] = torch.sum(task_vectors * ta_lambda, dim=0) + base_model_state_dict[_k]  # type: ignore
+            elif merging_strategy in ('ties-merging', 'Fisher', 'consensus'):
+                moerged_state_dict[_k] = merged_state_dict[_k]  # type: ignore
             else:
-                moerged_state_dict[_k] = torch.mean(torch.stack(tensors), dim=0)
-        
-    moerged_model, _, _ = get_llama_expert(config=config, num_parameters=num_parameters, moe_experts=moe_experts, k=k, temp=temp, _lambda=_lambda, context_dim=context_dim, alpha=alpha)
+                raise ValueError(f"Unknown merging strategy: {merging_strategy}")
+
+    if model_type == "llama":    
+        moerged_model, _, _ = get_llama_expert(config=config, num_parameters=num_parameters, moe_experts=moe_experts, k=k, temp=temp, _lambda=_lambda, context_dim=context_dim, alpha=alpha)
+    elif model_type == "gemma":
+        moerged_model = Gemma2ForCausalLM(config, moe_experts=moe_experts, k=k, temp=temp, _lambda=_lambda, context_dim=context_dim, alpha=alpha)
+    else:
+        raise NotImplementedError(f"Model type {model_type} not supported")
+    
     moerged_model.load_state_dict(moerged_state_dict, strict=False)  # routing keys still missing at this point
     
     moerged_model.to(device)
@@ -108,6 +190,25 @@ def collect_dume_stats(all_domains, all_dataloaders, moerged_model, device, num_
     moerged_model.set_rr_gate_mode(False)
 
 
+def collect_dume_stats_recursive(all_domains, all_dataloaders, moerged_model, device, num_steps):
+    print("Collecting DUMErec statistics...")
+    with torch.no_grad():
+        for layer_id in range(moerged_model._model.config.num_hidden_layers):
+            moerged_model.set_rr_gate_mode(True, layer_id=layer_id)
+            for expert_id, domain in enumerate(all_domains):
+                print(f"Collecting DUMErec statistics for layer {layer_id}, domain {domain}...")
+                dataloaders = all_dataloaders[domain]
+                pbar = tqdm(total=num_steps, desc='DUMErec stats collection')
+                for i, batch in enumerate(dataloaders['train']):
+                    input_ids = batch["input_ids"].to(device, non_blocking=True)
+                    moerged_model(input_ids=input_ids, expert_id=expert_id, layer_id=layer_id)
+                    pbar.update(1)
+                    if i + 1 >= num_steps:
+                        break
+                pbar.close()
+            moerged_model.set_rr_gate_mode(False, layer_id=layer_id)
+
+
 def merge_datasets(all_dataloaders, all_domains, seed):
     print("Merging datasets...")
     train_datasets = [all_dataloaders[domain]['train'].dataset for domain in all_domains]
@@ -125,18 +226,59 @@ def merge_datasets(all_dataloaders, all_domains, seed):
 def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    all_domains = ['cs_l1', 'math_l1', 'physics_l1', 'History_and_events', 'Philosophy_and_thinking']
     args = get_args()
+    if args.setting == 'clm':
+        all_domains = ['cs_l1', 'math_l1', 'physics_l1', 'History_and_events', 'Philosophy_and_thinking']
+    elif args.setting == 'clm2':
+        all_domains = ['math', 'bio', 'legal', 'dialogue']
+    else:
+        raise ValueError(f"Unknown setting: {args.setting}")
 
     # Loading all the dense experts and datasets
     state_dicts = []
     all_dataloaders = {}
     for domain in all_domains:
-        state_dicts.append(torch.load(f"checkpoints/llama_{int(args.num_parameters)}_{domain}{f'_seed={args.seed}' if args.seed != 42 else ''}.pth", map_location='cpu'))
-        all_dataloaders[domain] = get_dataloaders(dataset_name=domain, batch_size=args.batch_size, num_workers=args.num_workers)
+        # str_seed = "_seed=42" if args.num_parameters == 1.15e8 or args.freeze_attn else f"_seed={args.seed}"
+        str_seed = f"_seed={args.seed}"
+        path = f"checkpoints/llama_{int(args.num_parameters)}_{domain}{str_seed}{'_freeze_attn' if args.freeze_attn else ''}.pth"
+        print(path)
+        state_dicts.append(torch.load(path, map_location='cpu'))
+        if args.setting == 'clm':
+            all_dataloaders[domain] = get_dataloaders(dataset_name=domain, batch_size=args.batch_size, num_workers=args.num_workers)
+        elif args.setting == 'clm2':
+            tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.2-1B')
+            tokenizer.pad_token = tokenizer.eos_token
+            all_dataloaders[domain] = get_clm2_dataloaders(domain, args.batch_size, args.num_workers, tokenizer, args.max_num_tokens, args.max_num_samples)
 
+    if args.num_parameters == 1e9:
+        base_model = LlamaForCausalLM.from_pretrained('meta-llama/Llama-3.2-1B')
+        config = base_model.config 
+    else:
+        config = None
+    
     # MoErging all the dense experts. Randomly initializing the routers parameters for now.
-    moerged_model = moerge(state_dicts, device, num_parameters=args.num_parameters, domains=all_domains, k=args.k, temp=args.temp, _lambda=args._lambda, context_dim=args.num_dume_tokens, alpha=args.alpha)
+    moerged_model = moerge(
+        state_dicts=state_dicts,
+        device=device,
+        num_parameters=args.num_parameters,
+        domains=all_domains,
+        k=args.k,
+        temp=args.temp,
+        _lambda=args._lambda,
+        context_dim=args.num_dume_tokens,
+        config=config,
+        alpha=args.alpha,
+        return_moe_experts=False,
+        merging_strategy=args.merging_strategy,
+        ta_lambda=args.task_arithmetic_lambda,
+        ties_merging_k=args.ties_merging_k,
+        dare_p=args.dare_p,
+        num_fisher_steps=args.num_fisher_steps,
+        all_dataloaders=all_dataloaders,
+        consensus_threshold=args.consensus_threshold,
+        consensus_lambda_sparsity=args.consensus_lambda_sparsity,
+    )
+
     assert not isinstance(moerged_model, tuple), "Expected moerged_model to be a single model instance."
     
     if args.method == 'oracle':
@@ -164,6 +306,18 @@ def main():
         collect_dume_stats(all_domains, all_dataloaders, moerged_model, device, args.num_dume_stats_steps)
         print("DUME statistics collected. Evaluating DUME model...")  # Now, evaluate using the computed weights of the DUME routers
         
+    elif args.method == 'DUMErec':
+        """
+        Use the average parameters for all the layers except the MLP layers. Substitute the MLP layers with MoE blocks.
+        For routing, first forward all samples from each domain to the model to collect A and b DUME statistics before
+        the first MoE block. Then, compute optimal DUME routing weights for the first MoE block. Repeat for all the blocks,
+        forwarding again all the samples for each domain but this time using the computed DUME routing weights for the previous blocks.
+        Do no training, only evaluation.
+        """
+        assert args.alpha is None, "Alpha must be None for DUMErec."
+        collect_dume_stats_recursive(all_domains, all_dataloaders, moerged_model, device, args.num_dume_stats_steps)
+        print("DUMErec statistics collected. Evaluating DUMErec model...")  # Now, evaluate using the computed weights of the DUMErec routers
+    
     elif args.method == 'BTX':
         """
         Train and evaluate the BTX model.
@@ -171,9 +325,9 @@ def main():
 
         moerged_loader = merge_datasets(all_dataloaders, all_domains, args.seed)
 
-        # Freeze all layers except those with "gate" in their name
+        # Freeze all layers except those with "router" in their name
         for name, param in moerged_model.named_parameters():
-            param.requires_grad = ("gate" in name)
+            param.requires_grad = ("router" in name)
 
         loss_fn, optimizer, scheduler = get_training_strategy(moerged_model, args.lr, warmup_steps=10, num_steps=args.num_steps)
         device, world_size, amp_dtype, is_main = distributed_init()
@@ -190,7 +344,8 @@ def main():
 
         print("\nTraining BTX model...")
         train(moerged_loader, None, moerged_model, loss_fn, optimizer, scheduler, device, amp_dtype, use_fsdp,
-              num_steps=args.num_steps, num_val_steps=1, grad_accum_steps=1, eval_interval=10, is_main=is_main, alpha=args.alpha)
+              num_steps=args.num_steps, num_val_steps=1, grad_accum_steps=args.grad_accumulation_steps, eval_interval=10,
+              is_main=is_main, alpha=args.alpha, print_loss_interval=args.print_loss_interval, setting=args.setting)
 
         print("\nEvaluating BTX model...")
 
@@ -200,9 +355,9 @@ def main():
         collect_dume_stats(all_domains, all_dataloaders, moerged_model, device, args.num_dume_stats_steps)
         moerged_loader = merge_datasets(all_dataloaders, all_domains, args.seed)
 
-        # Freeze all layers except those with "gate" in their name
+        # Freeze all layers except those with "router" in their name
         for name, param in moerged_model.named_parameters():
-            param.requires_grad = ("gate" in name)
+            param.requires_grad = ("router" in name)
 
         loss_fn, optimizer, scheduler = get_training_strategy(moerged_model, args.lr, warmup_steps=10, num_steps=args.num_steps)
         device, world_size, amp_dtype, is_main = distributed_init()
@@ -220,7 +375,8 @@ def main():
 
         print("\nTraining DUME+ model...")
         train(moerged_loader, None, moerged_model, loss_fn, optimizer, scheduler, device, amp_dtype, use_fsdp,
-              num_steps=args.num_steps, num_val_steps=1, grad_accum_steps=1, eval_interval=10, is_main=is_main, alpha=args.alpha)
+              num_steps=args.num_steps, num_val_steps=1, grad_accum_steps=args.grad_accumulation_steps, eval_interval=10,
+              is_main=is_main, alpha=args.alpha, print_loss_interval=args.print_loss_interval, setting=args.setting)
 
         print("\nEvaluating DUME+ model...")
         
@@ -238,6 +394,34 @@ def main():
         perplexities[domain] = perplexity
     print(",".join(f"{domain}" for domain in all_domains))
     print(','.join(str(round(perplexities[domain], 2)) for domain in all_domains))
+
+    # TODO: adapt to necessity
+    if args.method == 'BTX':
+        with open(f"logs/{args.setting}_{args.method}_{args.k}_alpha={args.alpha}{'_freeze_attn' if args.freeze_attn else ''}.csv", "w") as f:
+            f.write(",".join(f"{domain}" for domain in all_domains) + "\n")
+            f.write(','.join(str(round(perplexities[domain], 2)) for domain in all_domains) + "\n")
+
+    if args.method == 'DUME':
+        if args.merging_strategy == 'task-arithmetic':
+            with open(f"logs/{args.setting}_DUME_{args.merging_strategy}_talambda={args.task_arithmetic_lambda}_seed={args.seed}.csv", "w") as f:
+                f.write(",".join(f"{domain}" for domain in all_domains) + "\n")
+                f.write(','.join(str(round(perplexities[domain], 2)) for domain in all_domains) + "\n")
+        elif args.merging_strategy == 'ties-merging':
+            with open(f"logs/{args.setting}_DUME_{args.merging_strategy}_k={args.ties_merging_k}_seed={args.seed}.csv", "w") as f:
+                f.write(",".join(f"{domain}" for domain in all_domains) + "\n")
+                f.write(','.join(str(round(perplexities[domain], 2)) for domain in all_domains) + "\n")
+        elif args.merging_strategy == 'DARE':
+            with open(f"logs/{args.setting}_DUME_{args.merging_strategy}_p={args.dare_p}_seed={args.seed}.csv", "w") as f:
+                f.write(",".join(f"{domain}" for domain in all_domains) + "\n")
+                f.write(','.join(str(round(perplexities[domain], 2)) for domain in all_domains) + "\n")
+        elif args.merging_strategy == 'Fisher':
+            with open(f"logs/{args.setting}_DUME_{args.merging_strategy}_steps={args.num_fisher_steps}_seed={args.seed}.csv", "w") as f:
+                f.write(",".join(f"{domain}" for domain in all_domains) + "\n")
+                f.write(','.join(str(round(perplexities[domain], 2)) for domain in all_domains) + "\n")
+        elif args.merging_strategy == 'consensus':
+            with open(f"logs/{args.setting}_DUME_{args.merging_strategy}_ct={args.consensus_threshold}_cls={args.consensus_lambda_sparsity}_seed={args.seed}.csv", "w") as f:
+                f.write(",".join(f"{domain}" for domain in all_domains) + "\n")
+                f.write(','.join(str(round(perplexities[domain], 2)) for domain in all_domains) + "\n")
 
 
 if __name__ == '__main__':
